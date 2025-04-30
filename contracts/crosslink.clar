@@ -184,3 +184,89 @@
     )
   ))
 
+(define-public (join-bridge
+    (bridge-id (buff 32)))
+  (let
+    (
+      (bridge-details (unwrap! (get-bridge-details bridge-id) ERR-BRIDGE-NOT-FOUND))
+      (sender tx-sender)
+    )
+    ;; Validate bridge state
+    (asserts! (is-eq (get status bridge-details) "pending") ERR-BRIDGE-COMPLETED)
+    (asserts! (is-none (get counterparty bridge-details)) ERR-BRIDGE-COMPLETED)
+    
+    ;; Update counterparty
+    (map-set bridge-operations
+      { bridge-id: bridge-id }
+      (merge bridge-details { 
+        counterparty: (some sender),
+        status: "active"
+      })
+    )
+    
+    (ok true)
+  ))
+
+(define-public (complete-bridge
+    (bridge-id (buff 32))
+    (secret (buff 32))
+    (token <token-trait>))
+  (let
+    (
+      (bridge-details (unwrap! (get-bridge-details bridge-id) ERR-BRIDGE-NOT-FOUND))
+      (participant (unwrap! (get counterparty bridge-details) ERR-UNAUTHORIZED))
+      (valid-token (try! (validate-token token)))
+      (current-height block-height)
+    )
+    ;; Validate bridge state
+    (asserts! (is-eq (get status bridge-details) "active") ERR-BRIDGE-COMPLETED)
+    (asserts! (< current-height (get expiry-block bridge-details)) ERR-BRIDGE-EXPIRED)
+    (asserts! (verify-secret secret (get secret-hash bridge-details)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq valid-token (get token-contract bridge-details)) ERR-INVALID-TOKEN)
+    
+    ;; Transfer tokens to participant
+    (try! (as-contract (contract-call? token transfer
+        (get amount bridge-details)
+        tx-sender
+        participant
+        none)))
+    
+    ;; Update status
+    (map-set bridge-operations
+      { bridge-id: bridge-id }
+      (merge bridge-details { status: "completed" })
+    )
+    
+    (ok true)
+  ))
+
+(define-public (reclaim-tokens
+    (bridge-id (buff 32))
+    (token <token-trait>))
+  (let
+    (
+      (bridge-details (unwrap! (get-bridge-details bridge-id) ERR-BRIDGE-NOT-FOUND))
+      (valid-token (try! (validate-token token)))
+      (current-height block-height)
+    )
+    ;; Validate bridge state
+    (asserts! (is-eq (get status bridge-details) "pending") ERR-BRIDGE-COMPLETED)
+    (asserts! (>= current-height (get expiry-block bridge-details)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq tx-sender (get initiator bridge-details)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq valid-token (get token-contract bridge-details)) ERR-INVALID-TOKEN)
+    
+    ;; Transfer tokens back to initiator
+    (try! (as-contract (contract-call? token transfer
+        (get amount bridge-details)
+        tx-sender
+        (get initiator bridge-details)
+        none)))
+    
+    ;; Update status
+    (map-set bridge-operations
+      { bridge-id: bridge-id }
+      (merge bridge-details { status: "reclaimed" })
+    )
+    
+    (ok true)
+  )))
