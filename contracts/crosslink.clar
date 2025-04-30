@@ -1,272 +1,290 @@
 ;; CrossLink: Multi-Chain Bridge Contract
 ;; Facilitates secure token transfers between different blockchain networks
+;; CrossLink Advanced Supply Chain Status Management Contract
 
-(use-trait token-trait .token-trait.token-trait)
+;; Enum-like Status Definitions
+(define-constant STATUS_REGISTERED "REGISTERED")
+(define-constant STATUS_PROCESSING "PROCESSING")
+(define-constant STATUS_DISPATCHED "DISPATCHED")
+(define-constant STATUS_RECEIVED "RECEIVED")
+(define-constant STATUS_COMPROMISED "COMPROMISED")
+(define-constant STATUS_MISSING "MISSING")
 
-;; Error codes
-(define-constant ERR-BRIDGE-EXPIRED (err u1))
-(define-constant ERR-BRIDGE-NOT-FOUND (err u2))
-(define-constant ERR-UNAUTHORIZED (err u3))
-(define-constant ERR-BRIDGE-COMPLETED (err u4))
-(define-constant ERR-INVALID-AMOUNT (err u5))
-(define-constant ERR-INSUFFICIENT-BALANCE (err u6))
-(define-constant ERR-INVALID-TOKEN (err u7))
-(define-constant ERR-INVALID-SECRET (err u8))
-(define-constant ERR-INVALID-CHAIN (err u9))
-(define-constant ERR-INVALID-RECIPIENT (err u10))
+;; Error Codes for Status Management
+(define-constant ERR_INVALID_STATUS_CHANGE (err u200))
+(define-constant ERR_UNAUTHORIZED_CHANGE (err u201))
+(define-constant ERR_ITEM_NOT_FOUND (err u202))
+(define-constant ERR_SENSOR_VERIFICATION_FAILED (err u203))
+(define-constant ERR_INVALID_INPUT (err u204))
+(define-constant ERR_INVALID_HASH (err u205))
+(define-constant ERR_INVALID_SENSOR_DEVICE (err u206))
 
-;; Constants for validation
-(define-constant CHAIN-NAME-MAX-LENGTH u8)
-(define-constant RECIPIENT-ADDRESS-MAX-LENGTH u42)
-(define-constant MIN-LOCK-PERIOD u1)
-(define-constant MAX-LOCK-PERIOD u1440)
-(define-constant SECRET-HASH-LENGTH u32)
-(define-constant MAX-TOKEN-AMOUNT u340282366920938463463374607431768211455)
-
-;; Data storage
-(define-map bridge-operations
-  { bridge-id: (buff 32) }
+;; Item Tracking Structure
+(define-map inventory
+  { item-id: uint }
   {
-    initiator: principal,
-    counterparty: (optional principal),
-    token-contract: principal,
-    amount: uint,
-    secret-hash: (buff 32),
-    expiry-block: uint,
-    status: (string-ascii 20),
-    target-chain: (string-ascii 8),
-    recipient-address: (string-ascii 42)
+    custodian: principal,
+    current-state: (string-ascii 20),
+    producer: principal,
+    timestamp: uint,
+    sensor-id: (optional (buff 32)),
+    verification-hash: (buff 32)
   }
 )
 
-(define-data-var operation-counter uint u0)
-
-;; Read-only functions
-(define-read-only (get-bridge-details (bridge-id (buff 32)))
-  (map-get? bridge-operations { bridge-id: bridge-id })
+;; Status Transition Rules
+(define-map state-transitions
+  { 
+    from-state: (string-ascii 20), 
+    to-state: (string-ascii 20) 
+  }
+  bool
 )
 
-(define-read-only (verify-secret (provided-secret (buff 32)) (stored-hash (buff 32)))
-  (is-eq (sha256 provided-secret) stored-hash)
+;; Sensor Device Verification
+(define-map sensor-devices
+  { device-id: (buff 32) }
+  {
+    registered-by: principal,
+    is-operational: bool,
+    item-id: (optional uint)
+  }
 )
 
-;; Validation functions
-(define-private (validate-token (token <token-trait>))
-  (let 
-    (
-      (contract-principal (contract-of token))
-    )
-    (match (contract-call? token get-name)
-      success (ok contract-principal)
-      error ERR-INVALID-TOKEN)))
+;; Event Notification Subscriptions
+(define-map state-change-subscriptions
+  { 
+    item-id: uint, 
+    subscriber: principal 
+  }
+  {
+    track-states: (list 10 (string-ascii 20))
+  }
+)
 
-(define-private (validate-secret-hash (hash (buff 32)))
-  (begin
-    (asserts! (is-eq (len hash) SECRET-HASH-LENGTH) ERR-INVALID-SECRET)
-    (asserts! (not (is-eq hash 0x0000000000000000000000000000000000000000000000000000000000000000)) ERR-INVALID-SECRET)
-    (ok hash)))
+;; Validation Functions
+(define-private (validate-hash (hash (buff 32)))
+  (> (len hash) u0))
 
-(define-private (validate-chain-name (chain-name (string-ascii 8)))
-  (begin
-    (asserts! (and 
-      (>= (len chain-name) u1) 
-      (<= (len chain-name) CHAIN-NAME-MAX-LENGTH)
-    ) ERR-INVALID-CHAIN)
-    (asserts! (is-some (index-of (list "bitcoin" "ethereum" "stacks") chain-name)) ERR-INVALID-CHAIN)
-    (ok chain-name)))
+(define-private (validate-sensor-id (device-id (buff 32)))
+  (and 
+    (> (len device-id) u0)
+    (match (map-get? sensor-devices { device-id: device-id })
+      device (get is-operational device)
+      false)))
 
-(define-private (validate-recipient (address (string-ascii 42)))
+;; Initialize Status Transition Rules
+(define-public (initialize-state-transitions)
   (begin
-    (asserts! (and 
-      (>= (len address) u1) 
-      (<= (len address) RECIPIENT-ADDRESS-MAX-LENGTH)
-    ) ERR-INVALID-RECIPIENT)
+    ;; Define valid status transitions
+    (map-set state-transitions 
+      { from-state: STATUS_REGISTERED, to-state: STATUS_PROCESSING } true)
+    (map-set state-transitions 
+      { from-state: STATUS_PROCESSING, to-state: STATUS_DISPATCHED } true)
+    (map-set state-transitions 
+      { from-state: STATUS_DISPATCHED, to-state: STATUS_RECEIVED } true)
+    (map-set state-transitions 
+      { from-state: STATUS_PROCESSING, to-state: STATUS_COMPROMISED } true)
+    (map-set state-transitions 
+      { from-state: STATUS_PROCESSING, to-state: STATUS_MISSING } true)
     
-    (let ((address-prefix (unwrap! (slice? address u0 u2) ERR-INVALID-RECIPIENT)))
-      (asserts! (is-some (index-of (list (convert-prefix "0x") 
-                                        (convert-prefix "bc") 
-                                        (convert-prefix "SP")) 
-                                  (convert-prefix address-prefix))) 
-               ERR-INVALID-RECIPIENT))
+    (ok true)
+  )
+)
+
+;; Helper function to validate status
+(define-private (validate-state (state (string-ascii 20)))
+  (or 
+    (is-eq state STATUS_REGISTERED)
+    (is-eq state STATUS_PROCESSING)
+    (is-eq state STATUS_DISPATCHED)
+    (is-eq state STATUS_RECEIVED)
+    (is-eq state STATUS_COMPROMISED)
+    (is-eq state STATUS_MISSING)
+  )
+)
+
+;; Register a New Item with Authenticity Proof
+(define-public (register-item
+  (item-id uint)
+  (producer principal)
+  (initial-state (string-ascii 20))
+  (verification-hash (buff 32))
+  (timestamp uint)
+  (optional-sensor-id (optional (buff 32)))
+)
+  (begin
+    ;; Ensure item doesn't already exist
+    (asserts! (is-none (map-get? inventory { item-id: item-id })) ERR_ITEM_NOT_FOUND)
+    ;; Validate initial status
+    (asserts! (validate-state initial-state) ERR_INVALID_INPUT)
+    ;; Validate input data
+    (asserts! (> item-id u0) ERR_INVALID_INPUT)
+    (asserts! (> timestamp u0) ERR_INVALID_INPUT)
+    ;; Validate producer
+    (asserts! (is-eq tx-sender producer) ERR_UNAUTHORIZED_CHANGE)
+    ;; Validate authentication hash
+    (asserts! (validate-hash verification-hash) ERR_INVALID_HASH)
     
-    (ok address)))
-
-(define-private (convert-prefix (s (string-ascii 42)))
-  (unwrap-panic (slice? s u0 u2)))
-
-(define-private (validate-amount (amount uint))
-  (begin
-    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-    (asserts! (<= amount MAX-TOKEN-AMOUNT) ERR-INVALID-AMOUNT)
-    (ok amount)))
-
-(define-private (validate-lock-period (period uint))
-  (begin
-    (asserts! (>= period MIN-LOCK-PERIOD) ERR-INVALID-AMOUNT)
-    (asserts! (<= period MAX-LOCK-PERIOD) ERR-INVALID-AMOUNT)
-    (ok period)))
-
-(define-private (calculate-expiry (current-height uint) (period uint))
-  (begin
-    (let ((expiry (+ current-height period)))
-      (asserts! (<= expiry MAX-TOKEN-AMOUNT) ERR-INVALID-AMOUNT)
-      (ok expiry))))
-
-;; Helper function
-(define-private (generate-bridge-id)
-  (sha256 (concat 
-    (unwrap-panic (to-consensus-buff? (var-get operation-counter)))
-    (unwrap-panic (to-consensus-buff? block-height))
-  )))
-
-;; Public functions
-(define-public (create-bridge
-    (token <token-trait>)
-    (amount uint)
-    (secret-hash (buff 32))
-    (lock-period uint)
-    (target-chain (string-ascii 8))
-    (recipient-address (string-ascii 42)))
-  (let
-    (
-      (bridge-id (generate-bridge-id))
-      (sender tx-sender)
-      (current-height block-height)
+    ;; Validate optional sensor device if provided
+    (asserts! (match optional-sensor-id
+                device-id (validate-sensor-id device-id)
+                true) 
+              ERR_INVALID_SENSOR_DEVICE)
+    
+    ;; Register item with initial details
+    (map-set inventory 
+      { item-id: item-id }
+      {
+        custodian: tx-sender,
+        current-state: initial-state,
+        producer: producer,
+        timestamp: timestamp,
+        sensor-id: optional-sensor-id,
+        verification-hash: verification-hash
+      }
     )
-    ;; Validate all inputs
-    (let 
-      (
-        (valid-amount (try! (validate-amount amount)))
-        (valid-period (try! (validate-lock-period lock-period)))
-        (valid-token (try! (validate-token token)))
-        (valid-hash (try! (validate-secret-hash secret-hash)))
-        (valid-chain (try! (validate-chain-name target-chain)))
-        (valid-recipient (try! (validate-recipient recipient-address)))
-        (valid-expiry (try! (calculate-expiry current-height valid-period)))
-      )
-      
-      ;; Check token balance
-      (let
-        (
-          (sender-balance (unwrap! (contract-call? token get-balance sender) 
-                                  ERR-INSUFFICIENT-BALANCE))
+    
+    ;; Optional Sensor Device Registration
+    (match optional-sensor-id
+      device-id 
+        (begin
+          (asserts! (validate-sensor-id device-id) ERR_INVALID_SENSOR_DEVICE)
+          (map-set sensor-devices 
+            { device-id: device-id }
+            {
+              registered-by: tx-sender,
+              is-operational: true,
+              item-id: (some item-id)
+            }
+          ))
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+;; Subscribe to Status Change Notifications
+(define-public (subscribe-to-state-events
+  (item-id uint)
+  (track-states (list 10 (string-ascii 20)))
+)
+  (begin
+    ;; Validate item-id
+    (asserts! (> item-id u0) ERR_INVALID_INPUT)
+    ;; Validate all statuses in the list
+    (asserts! (fold check-state track-states true) ERR_INVALID_INPUT)
+    
+    (map-set state-change-subscriptions 
+      { 
+        item-id: item-id, 
+        subscriber: tx-sender 
+      }
+      { track-states: track-states }
+    )
+    (ok true)
+  )
+)
+
+;; Helper function to check status validity
+(define-private (check-state (state (string-ascii 20)) (valid bool))
+  (and valid (validate-state state))
+)
+
+;; Internal Function to Notify Subscribers
+(define-private (notify-state-subscribers
+  (item-id uint)
+  (new-state (string-ascii 20))
+)
+  (match 
+    (map-get? state-change-subscriptions 
+      { 
+        item-id: item-id, 
+        subscriber: tx-sender 
+      }
+    )
+    subscription
+    (if (is-some (index-of (get track-states subscription) new-state))
+        (begin
+          ;; Future: Implement actual notification mechanism
+          (print {
+            event: "state-change-notification",
+            item-id: item-id,
+            state: new-state,
+            subscriber: tx-sender
+          })
+          (ok true)
         )
-        (asserts! (>= sender-balance valid-amount) ERR-INSUFFICIENT-BALANCE)
-        
-        ;; Transfer tokens to contract
-        (try! (contract-call? token transfer 
-          valid-amount
-          sender
-          (as-contract tx-sender)
-          none))
-        
-        ;; Create bridge record
-        (map-set bridge-operations
-          { bridge-id: bridge-id }
-          {
-            initiator: sender,
-            counterparty: none,
-            token-contract: valid-token,
-            amount: valid-amount,
-            secret-hash: valid-hash,
-            expiry-block: valid-expiry,
-            status: "pending",
-            target-chain: valid-chain,
-            recipient-address: valid-recipient
-          }
-        )
-        
-        ;; Increment counter
-        (var-set operation-counter (+ (var-get operation-counter) u1))
-        
-        (ok bridge-id)
-      )
+        (ok false)
     )
-  ))
+    (ok false)
+  )
+)
 
-(define-public (join-bridge
-    (bridge-id (buff 32)))
-  (let
-    (
-      (bridge-details (unwrap! (get-bridge-details bridge-id) ERR-BRIDGE-NOT-FOUND))
-      (sender tx-sender)
-    )
-    ;; Validate bridge state
-    (asserts! (is-eq (get status bridge-details) "pending") ERR-BRIDGE-COMPLETED)
-    (asserts! (is-none (get counterparty bridge-details)) ERR-BRIDGE-COMPLETED)
+;; Sensor Device Registration
+(define-public (register-sensor-device
+  (device-id (buff 32))
+  (item-id (optional uint))
+)
+  (begin
+    ;; Validate device-id
+    (asserts! (> (len device-id) u0) ERR_INVALID_SENSOR_DEVICE)
     
-    ;; Update counterparty
-    (map-set bridge-operations
-      { bridge-id: bridge-id }
-      (merge bridge-details { 
-        counterparty: (some sender),
-        status: "active"
-      })
-    )
+    ;; Validate item-id if provided
+    (asserts! (match item-id
+                id (> id u0)
+                true
+              ) ERR_INVALID_INPUT)
     
+    (map-set sensor-devices 
+      { device-id: device-id }
+      {
+        registered-by: tx-sender,
+        is-operational: true,
+        item-id: item-id
+      }
+    )
     (ok true)
-  ))
+  )
+)
 
-(define-public (complete-bridge
-    (bridge-id (buff 32))
-    (secret (buff 32))
-    (token <token-trait>))
-  (let
-    (
-      (bridge-details (unwrap! (get-bridge-details bridge-id) ERR-BRIDGE-NOT-FOUND))
-      (participant (unwrap! (get counterparty bridge-details) ERR-UNAUTHORIZED))
-      (valid-token (try! (validate-token token)))
-      (current-height block-height)
+;; Helper function for batch status processing
+(define-private (process-item-state
+    (item-id uint)
+    (result {
+        states: (list 50 {
+            item-id: uint,
+            state: (optional (string-ascii 20)),
+            timestamp: (optional uint)
+        }),
+        count: uint
+    })
+)
+    (let (
+        (item-details (map-get? inventory { item-id: item-id }))
     )
-    ;; Validate bridge state
-    (asserts! (is-eq (get status bridge-details) "active") ERR-BRIDGE-COMPLETED)
-    (asserts! (< current-height (get expiry-block bridge-details)) ERR-BRIDGE-EXPIRED)
-    (asserts! (verify-secret secret (get secret-hash bridge-details)) ERR-UNAUTHORIZED)
-    (asserts! (is-eq valid-token (get token-contract bridge-details)) ERR-INVALID-TOKEN)
-    
-    ;; Transfer tokens to participant
-    (try! (as-contract (contract-call? token transfer
-        (get amount bridge-details)
-        tx-sender
-        participant
-        none)))
-    
-    ;; Update status
-    (map-set bridge-operations
-      { bridge-id: bridge-id }
-      (merge bridge-details { status: "completed" })
+        {
+            states: (unwrap-panic 
+                (as-max-len? 
+                    (concat 
+                        (get states result)
+                        (list {
+                            item-id: item-id,
+                            state: (match item-details
+                                details (some (get current-state details))
+                                none
+                            ),
+                            timestamp: (match item-details
+                                details (some (get timestamp details))
+                                none
+                            )
+                        })
+                    )
+                    u50
+                )
+            ),
+            count: (+ (get count result) u1)
+        }
     )
-    
-    (ok true)
-  ))
-
-(define-public (reclaim-tokens
-    (bridge-id (buff 32))
-    (token <token-trait>))
-  (let
-    (
-      (bridge-details (unwrap! (get-bridge-details bridge-id) ERR-BRIDGE-NOT-FOUND))
-      (valid-token (try! (validate-token token)))
-      (current-height block-height)
-    )
-    ;; Validate bridge state
-    (asserts! (is-eq (get status bridge-details) "pending") ERR-BRIDGE-COMPLETED)
-    (asserts! (>= current-height (get expiry-block bridge-details)) ERR-UNAUTHORIZED)
-    (asserts! (is-eq tx-sender (get initiator bridge-details)) ERR-UNAUTHORIZED)
-    (asserts! (is-eq valid-token (get token-contract bridge-details)) ERR-INVALID-TOKEN)
-    
-    ;; Transfer tokens back to initiator
-    (try! (as-contract (contract-call? token transfer
-        (get amount bridge-details)
-        tx-sender
-        (get initiator bridge-details)
-        none)))
-    
-    ;; Update status
-    (map-set bridge-operations
-      { bridge-id: bridge-id }
-      (merge bridge-details { status: "reclaimed" })
-    )
-    
-    (ok true)
-  )))
+)
